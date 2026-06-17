@@ -1,0 +1,577 @@
+#!/usr/bin/env bash
+set -u
+
+INCUS_CPU_VERSION="2026-06-17-v4-scan-all-running"
+
+BACKUP_DIR="/root/incus-cpu-backups"
+mkdir -p "$BACKUP_DIR"
+
+need_incus() {
+  command -v incus >/dev/null 2>&1 || {
+    echo "ERROR: incus not found"
+    exit 1
+  }
+}
+
+names() {
+  incus list --format csv -c n 2>/dev/null | sed '/^$/d'
+}
+
+running_names() {
+  incus list --format csv -c ns 2>/dev/null | awk -F, '$2=="RUNNING"{print $1}'
+}
+
+state() {
+  incus info "$1" 2>/dev/null | awk -F': ' '/^Status:/ {print $2; exit}'
+}
+
+cfg() {
+  incus config get "$1" "$2" 2>/dev/null || true
+}
+
+ct_pid() {
+  incus info "$1" 2>/dev/null | awk '/^PID:/ {print $2; exit}'
+}
+
+cgpath() {
+  local ct="$1" pid cg p best
+
+  pid=$(ct_pid "$ct")
+  [ -n "${pid:-}" ] || return 1
+  [ -r "/proc/$pid/cgroup" ] || return 1
+
+  cg=$(awk -F: '$1=="0"{print $3; exit}' "/proc/$pid/cgroup")
+  [ -n "$cg" ] || return 1
+
+  p="/sys/fs/cgroup$cg"
+  best=""
+
+  while [ "$p" != "/sys/fs/cgroup" ]; do
+    if [ -f "$p/cpu.stat" ]; then
+      best="$p"
+      break
+    fi
+    p=$(dirname "$p")
+  done
+
+  [ -n "$best" ] || return 1
+  echo "$best"
+}
+
+find_up_file() {
+  local p="$1" file="$2"
+
+  while [ "$p" != "/sys/fs/cgroup" ]; do
+    if [ -f "$p/$file" ]; then
+      echo "$p/$file"
+      return 0
+    fi
+    p=$(dirname "$p")
+  done
+
+  return 1
+}
+
+cmax() {
+  local ct="$1" p f
+
+  [ "$(state "$ct")" = "RUNNING" ] || {
+    echo "-"
+    return
+  }
+
+  p=$(cgpath "$ct" 2>/dev/null || true)
+  [ -n "${p:-}" ] || {
+    echo "-"
+    return
+  }
+
+  f=$(find_up_file "$p" "cpu.max" 2>/dev/null || true)
+  [ -n "${f:-}" ] && cat "$f" || echo "-"
+}
+
+usage_usec() {
+  awk '/usage_usec/ {print $2; exit}' "$1/cpu.stat"
+}
+
+check() {
+  local ct st cpu alw prio max result
+  printf "%-28s %-9s %-8s %-16s %-8s %-18s %s\n" \
+    "NAME" "STATE" "CPU" "ALLOWANCE" "PRIO" "CPU.MAX" "RESULT"
+
+  for ct in $(names); do
+    st=$(state "$ct")
+    cpu=$(cfg "$ct" limits.cpu)
+    alw=$(cfg "$ct" limits.cpu.allowance)
+    prio=$(cfg "$ct" limits.cpu.priority)
+    max=$(cmax "$ct")
+
+    st=${st:--}
+    cpu=${cpu:--}
+    alw=${alw:--}
+    prio=${prio:--}
+
+    if [ "$cpu" = "-" ] && [ "$alw" = "-" ]; then
+      result="未配置CPU限制"
+    elif [[ "$alw" == *% ]]; then
+      result="百分比软限制"
+    elif [[ "$alw" =~ ^[0-9]+ms/100ms$ ]] && [[ "$max" != max* ]] && [ "$max" != "-" ]; then
+      result="硬限速"
+    elif [[ "$alw" =~ ^[0-9]+ms/100ms$ ]] && [[ "$max" == max* ]]; then
+      result="配置硬限但未生效"
+    elif [[ "$max" == max* ]]; then
+      result="无硬限速"
+    else
+      result="OK"
+    fi
+
+    printf "%-28s %-9s %-8s %-16s %-8s %-18s %s\n" \
+      "$ct" "$st" "$cpu" "$alw" "$prio" "$max" "$result"
+  done
+}
+
+backup() {
+  local f ct st cpu alw prio
+  f="$BACKUP_DIR/incus-cpu-config-backup-$(date +%Y%m%d-%H%M%S).txt"
+
+  echo "name|state|limits.cpu|limits.cpu.allowance|limits.cpu.priority" > "$f"
+
+  for ct in $(names); do
+    st=$(state "$ct")
+    cpu=$(cfg "$ct" limits.cpu)
+    alw=$(cfg "$ct" limits.cpu.allowance)
+    prio=$(cfg "$ct" limits.cpu.priority)
+
+    [ -n "$st" ] || st="UNKNOWN"
+    [ -n "$cpu" ] || cpu="__EMPTY__"
+    [ -n "$alw" ] || alw="__EMPTY__"
+    [ -n "$prio" ] || prio="__EMPTY__"
+
+    echo "$ct|$st|$cpu|$alw|$prio" >> "$f"
+  done
+
+  echo "Backup saved: $f"
+}
+
+restore_backup() {
+  local f="${1:-}" ct st cpu alw prio
+
+  if [ -z "$f" ]; then
+    echo "可用备份："
+    ls -1t "$BACKUP_DIR"/*.txt 2>/dev/null | head -20 || true
+    echo
+    read -rp "输入备份文件完整路径: " f
+  fi
+
+  [ -f "$f" ] || {
+    echo "备份不存在: $f"
+    return 1
+  }
+
+  while IFS='|' read -r ct st cpu alw prio; do
+    [ "$ct" = "name" ] && continue
+    echo "Restoring $ct"
+
+    if [ "$cpu" = "__EMPTY__" ]; then
+      incus config unset "$ct" limits.cpu 2>/dev/null || true
+    else
+      incus config set "$ct" limits.cpu "$cpu"
+    fi
+
+    if [ "$alw" = "__EMPTY__" ]; then
+      incus config unset "$ct" limits.cpu.allowance 2>/dev/null || true
+    else
+      incus config set "$ct" limits.cpu.allowance "$alw"
+    fi
+
+    if [ "$prio" = "__EMPTY__" ]; then
+      incus config unset "$ct" limits.cpu.priority 2>/dev/null || true
+    else
+      incus config set "$ct" limits.cpu.priority "$prio"
+    fi
+  done < "$f"
+
+  check
+}
+
+apply_mode() {
+  local mode="$1" ct old new num
+
+  backup >/dev/null
+
+  for ct in $(names); do
+    old=$(cfg "$ct" limits.cpu.allowance)
+    new=""
+
+    case "$mode" in
+      hard)
+        if [[ "$old" == *% ]]; then
+          num="${old%\%}"
+          new="${num}ms/100ms"
+        fi
+        ;;
+      soft)
+        if [[ "$old" =~ ^([0-9]+)ms/100ms$ ]]; then
+          num="${BASH_REMATCH[1]}"
+          new="${num}%"
+        fi
+        ;;
+      double)
+        if [[ "$old" =~ ^([0-9]+)ms/100ms$ ]]; then
+          num="${BASH_REMATCH[1]}"
+          new="$((num * 2))ms/100ms"
+        fi
+        ;;
+      half)
+        if [[ "$old" =~ ^([0-9]+)ms/100ms$ ]]; then
+          num="${BASH_REMATCH[1]}"
+          new="$((num / 2))ms/100ms"
+        fi
+        ;;
+      restore)
+        case "$old" in
+          40ms/100ms|40%) new="20%" ;;
+          50ms/100ms|50%) new="25%" ;;
+          60ms/100ms|60%) new="30%" ;;
+        esac
+        ;;
+    esac
+
+    if [ -n "$new" ] && [ "$new" != "$old" ]; then
+      echo "$ct: $old -> $new"
+      incus config set "$ct" limits.cpu.allowance "$new"
+    else
+      echo "Skip $ct: allowance=${old:-EMPTY}"
+    fi
+  done
+
+  check
+}
+
+set_all() {
+  local val="${1:-}" ct old
+
+  [ -n "$val" ] || {
+    echo "用法: incus-cpu set-all 20%"
+    return 1
+  }
+
+  [[ "$val" =~ ^[0-9]+%$ || "$val" =~ ^[0-9]+ms/100ms$ ]] || {
+    echo "值无效: $val"
+    echo "示例: 20% 或 20ms/100ms"
+    return 1
+  }
+
+  backup >/dev/null
+
+  for ct in $(names); do
+    old=$(cfg "$ct" limits.cpu.allowance)
+    echo "$ct: ${old:-EMPTY} -> $val"
+    incus config set "$ct" limits.cpu.allowance "$val"
+  done
+
+  check
+}
+
+set_one() {
+  local ct="${1:-}" val="${2:-}" old
+
+  [ -n "$ct" ] && [ -n "$val" ] || {
+    echo "用法: incus-cpu set-one 小鸡名 20%"
+    return 1
+  }
+
+  [[ "$val" =~ ^[0-9]+%$ || "$val" =~ ^[0-9]+ms/100ms$ ]] || {
+    echo "值无效: $val"
+    echo "示例: 20% 或 20ms/100ms"
+    return 1
+  }
+
+  backup >/dev/null
+
+  old=$(cfg "$ct" limits.cpu.allowance)
+  echo "$ct: ${old:-EMPTY} -> $val"
+  incus config set "$ct" limits.cpu.allowance "$val"
+
+  check
+}
+
+sample_one() {
+  local ct="${1:-}" sec="${2:-10}" p f a b diff cores ncores hostpct max
+
+  [ -n "$ct" ] || {
+    echo "用法: incus-cpu sample 小鸡名 10"
+    return 1
+  }
+
+  p=$(cgpath "$ct" 2>/dev/null || true)
+  [ -n "${p:-}" ] || {
+    echo "找不到 cgroup: $ct"
+    return 1
+  }
+
+  f=$(find_up_file "$p" "cpu.max" 2>/dev/null || true)
+  [ -n "${f:-}" ] && max=$(cat "$f") || max="-"
+
+  ncores=$(nproc)
+  a=$(usage_usec "$p")
+  sleep "$sec"
+  b=$(usage_usec "$p")
+  diff=$((b - a))
+
+  cores=$(awk -v d="$diff" -v s="$sec" 'BEGIN {printf "%.2f", d/(s*1000000)}')
+  hostpct=$(awk -v c="$cores" -v n="$ncores" 'BEGIN {printf "%.2f%%", c/n*100}')
+
+  echo "CT=$ct"
+  echo "CGPATH=$p"
+  echo "CPU.MAX=$max"
+  echo "采样 ${sec}s CPU 使用: $diff usec"
+  echo "约等于: ${cores} 核"
+  echo "折算宿主机占比: ${hostpct}"
+}
+
+detect_bad() {
+  local ct="$1"
+
+  incus exec "$ct" -- sh -c '
+    { ps -o pid,ppid,stat,pcpu,pmem,etime,args 2>/dev/null || ps aux 2>/dev/null || true; } \
+    | grep -E "INCUSHLII_EXTRA|/bin/bash[[:space:]]+/usr/local/bin/sb([[:space:]]|$)" \
+    | grep -v "sb-timer.sh" \
+    | grep -v grep || true
+  ' 2>/dev/null || true
+}
+
+top_inside() {
+  local ct="$1"
+  incus exec "$ct" -- sh -c 'ps aux 2>/dev/null | sort -k3 -nr | head -8' 2>/dev/null || true
+}
+
+scan() {
+  local sec="${1:-30}" threshold="${2:-0.80}"
+  local tmp f ct p a b diff cores hostpct ncores max cpu alw bad hot status maxfile
+
+  tmp=$(mktemp -d /tmp/incus-cpu-scan.XXXXXX)
+  f="$tmp/before.txt"
+  : > "$f"
+
+  ncores=$(nproc)
+
+  echo "采样时间: ${sec}s"
+  echo "宿主机核心数: $ncores"
+  echo "高CPU阈值: >= ${threshold} 核"
+  echo "注意: sb-timer.sh 不会被判定为异常"
+  echo
+
+  for ct in $(names); do
+    [ "$(state "$ct")" = "RUNNING" ] || continue
+    p=$(cgpath "$ct" 2>/dev/null || true)
+    [ -n "${p:-}" ] || continue
+    a=$(usage_usec "$p")
+    echo "$ct|$p|$a" >> "$f"
+  done
+
+  echo "正在采样 ${sec} 秒..."
+  sleep "$sec"
+  echo
+
+  printf "%-28s %-8s %-14s %-12s %-14s %-18s %s\n" \
+    "NAME" "CPU" "ALLOWANCE" "USED_CORES" "HOST_PERCENT" "CPU.MAX" "STATUS"
+
+  rm -f /tmp/incus-cpu-restart-candidates.txt
+  rm -f /tmp/incus-cpu-high-candidates.txt
+
+  while IFS='|' read -r ct p a; do
+    b=$(usage_usec "$p")
+    diff=$((b - a))
+    cores=$(awk -v d="$diff" -v s="$sec" 'BEGIN {printf "%.2f", d/(s*1000000)}')
+    hostpct=$(awk -v c="$cores" -v n="$ncores" 'BEGIN {printf "%.2f%%", c/n*100}')
+
+    maxfile=$(find_up_file "$p" "cpu.max" 2>/dev/null || true)
+    [ -n "${maxfile:-}" ] && max=$(cat "$maxfile") || max="-"
+
+    cpu=$(cfg "$ct" limits.cpu)
+    [ -n "$cpu" ] || cpu="-"
+    alw=$(cfg "$ct" limits.cpu.allowance)
+    [ -n "$alw" ] || alw="-"
+
+    bad=$(detect_bad "$ct")
+    hot=$(awk -v c="$cores" -v t="$threshold" 'BEGIN {print (c >= t) ? 1 : 0}')
+
+    if [ "$hot" = "1" ] && [ -n "$bad" ]; then
+      status="异常: 高CPU+sb菜单残留"
+      echo "$ct|$cores|$hostpct|$status" >> /tmp/incus-cpu-restart-candidates.txt
+      echo "$ct|$cores|$hostpct|$status" >> /tmp/incus-cpu-high-candidates.txt
+    elif [ "$hot" = "1" ]; then
+      status="高CPU"
+      echo "$ct|$cores|$hostpct|$status" >> /tmp/incus-cpu-high-candidates.txt
+    elif [ -n "$bad" ]; then
+      status="提示: sb菜单残留但CPU不高"
+    else
+      status="OK"
+    fi
+
+    printf "%-28s %-8s %-14s %-12s %-14s %-18s %s\n" \
+      "$ct" "$cpu" "$alw" "$cores" "$hostpct" "$max" "$status"
+
+    if [ "$status" != "OK" ]; then
+      echo
+      echo "===== $ct 相关进程 ====="
+      [ -n "$bad" ] && echo "$bad" || echo "未发现 sb 菜单/安装残留"
+      echo
+      echo "===== $ct TOP 进程 ====="
+      top_inside "$ct"
+      echo
+    fi
+  done < "$f"
+
+  rm -rf "$tmp"
+}
+
+restart_file() {
+  local file="$1" ct cores hostpct status ans
+
+  [ -s "$file" ] || {
+    echo "没有候选小鸡"
+    return
+  }
+
+  cat "$file"
+  echo
+
+  read -rp "确认重启这些小鸡吗？[y/N]: " ans
+  [[ "$ans" =~ ^[Yy]$ ]] || {
+    echo "已取消"
+    return
+  }
+
+  while IFS='|' read -r ct cores hostpct status; do
+    echo "Restarting $ct used=${cores}core host=${hostpct} status=${status}"
+    incus restart "$ct"
+  done < "$file"
+
+  sleep 5
+  check
+}
+
+scan_restart() {
+  local sec="${1:-30}" threshold="${2:-0.80}" ans
+
+  scan "$sec" "$threshold"
+
+  echo
+  echo "选择重启范围:"
+  echo "1) 只重启 高CPU + sb菜单残留"
+  echo "2) 重启 所有高CPU小鸡"
+  echo "0) 不重启"
+
+  read -rp "请输入选项: " ans
+
+  case "$ans" in
+    1) restart_file /tmp/incus-cpu-restart-candidates.txt ;;
+    2) restart_file /tmp/incus-cpu-high-candidates.txt ;;
+    0) echo "已取消" ;;
+    *) echo "无效选项" ;;
+  esac
+}
+
+clean_sb() {
+  local ct bad
+
+  for ct in $(names); do
+    [ "$(state "$ct")" = "RUNNING" ] || continue
+    bad=$(detect_bad "$ct")
+
+    if [ -n "$bad" ]; then
+      echo "===== cleaning $ct ====="
+      echo "$bad"
+
+      incus exec "$ct" -- sh -c '
+        pkill -TERM -f "^/bin/bash /usr/local/bin/sb$" 2>/dev/null || true
+        pkill -TERM -f "INCUSHLII_EXTRA_" 2>/dev/null || true
+        sleep 2
+        pkill -KILL -f "^/bin/bash /usr/local/bin/sb$" 2>/dev/null || true
+        pkill -KILL -f "INCUSHLII_EXTRA_" 2>/dev/null || true
+      ' 2>/dev/null || true
+    fi
+  done
+}
+
+menu() {
+  while true; do
+    echo
+    echo "========== Incus CPU 管理 =========="
+    echo "1) 查看 CPU 限制"
+    echo "2) 备份配置"
+    echo "3) 软限制 -> 硬限制"
+    echo "4) 硬限制 -> 软限制"
+    echo "5) 硬限制翻倍"
+    echo "6) 恢复原始软限制 40/50/60 -> 20/25/30"
+    echo "7) 设置全部 allowance"
+    echo "8) 设置单台 allowance"
+    echo "9) 单台采样"
+    echo "10) 采样30秒扫描异常/高CPU"
+    echo "11) 采样30秒后选择重启范围"
+    echo "12) 清理真正 sb 菜单残留"
+    echo "0) 退出"
+    echo "==================================="
+
+    read -rp "请选择: " x
+
+    case "$x" in
+      1) check; read -rp "回车继续..." _ ;;
+      2) backup; read -rp "回车继续..." _ ;;
+      3) apply_mode hard; read -rp "回车继续..." _ ;;
+      4) apply_mode soft; read -rp "回车继续..." _ ;;
+      5) apply_mode double; read -rp "回车继续..." _ ;;
+      6) apply_mode restore; read -rp "回车继续..." _ ;;
+      7) read -rp "输入值，例如 20% 或 20ms/100ms: " v; set_all "$v"; read -rp "回车继续..." _ ;;
+      8) read -rp "输入小鸡名: " ct; read -rp "输入值: " v; set_one "$ct" "$v"; read -rp "回车继续..." _ ;;
+      9) read -rp "输入小鸡名: " ct; read -rp "采样秒数，默认10: " s; sample_one "$ct" "${s:-10}"; read -rp "回车继续..." _ ;;
+      10) read -rp "采样秒数，默认30: " s; read -rp "阈值，默认0.80核: " t; scan "${s:-30}" "${t:-0.80}"; read -rp "回车继续..." _ ;;
+      11) read -rp "采样秒数，默认30: " s; read -rp "阈值，默认0.80核: " t; scan_restart "${s:-30}" "${t:-0.80}"; read -rp "回车继续..." _ ;;
+      12) clean_sb; read -rp "回车继续..." _ ;;
+      0) exit 0 ;;
+      *) echo "无效选项" ;;
+    esac
+  done
+}
+
+help() {
+  echo "incus-cpu $INCUS_CPU_VERSION"
+  echo "用法:"
+  echo "  incus-cpu                         打开菜单"
+  echo "  incus-cpu check                   查看 CPU 限制"
+  echo "  incus-cpu backup                  备份配置"
+  echo "  incus-cpu hard                    软限制改硬限制"
+  echo "  incus-cpu soft                    硬限制改软限制"
+  echo "  incus-cpu double                  硬限制翻倍"
+  echo "  incus-cpu restore                 40/50/60 恢复 20/25/30"
+  echo "  incus-cpu set-all 20%             设置全部"
+  echo "  incus-cpu set-one CT 20%          设置单台"
+  echo "  incus-cpu sample CT 10            单台采样"
+  echo "  incus-cpu scan 30                 扫描高CPU/异常"
+  echo "  incus-cpu scan 30 0.80            扫描，阈值0.80核"
+  echo "  incus-cpu scan-restart 30         扫描后选择重启范围"
+  echo "  incus-cpu clean-sb                清理真正 sb 菜单残留"
+}
+
+need_incus
+
+case "${1:-menu}" in
+  menu) menu ;;
+  check) check ;;
+  backup) backup ;;
+  hard) apply_mode hard ;;
+  soft) apply_mode soft ;;
+  double) apply_mode double ;;
+  restore) apply_mode restore ;;
+  set-all) set_all "${2:-}" ;;
+  set-one) set_one "${2:-}" "${3:-}" ;;
+  sample) sample_one "${2:-}" "${3:-10}" ;;
+  scan) scan "${2:-30}" "${3:-0.80}" ;;
+  scan-restart) scan_restart "${2:-30}" "${3:-0.80}" ;;
+  clean-sb) clean_sb ;;
+  restore-backup) restore_backup "${2:-}" ;;
+  help|-h|--help) help ;;
+  *) echo "未知命令: $1"; help; exit 1 ;;
+esac
